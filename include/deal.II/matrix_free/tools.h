@@ -2111,6 +2111,47 @@ namespace MatrixFreeTools
 
   namespace internal
   {
+    // Primary template: default case for any type that is not a BlockMatrixBase
+    template <typename>
+    struct is_block_matrix_impl : std::false_type
+    {};
+
+    // Specialization: case for a BlockMatrixBase<T>
+    template <typename T>
+    struct is_block_matrix_impl<BlockMatrixBase<T>> : std::true_type
+    {};
+
+    // Helper to check a single base class
+    template <template <typename> class Base, typename Derived>
+    struct is_base_of_template_impl
+    {
+      template <typename T>
+      static constexpr std::true_type
+      test(const Base<T> *);
+
+      static constexpr std::false_type
+      test(...);
+
+      using type = decltype(test(std::declval<Derived *>()));
+    };
+
+    // Check if any base class is a specialization of the template
+    template <template <typename> class Base, typename Derived>
+    using is_base_of_template =
+      typename is_base_of_template_impl<Base, Derived>::type;
+
+    // Combined trait to check for specialization or inheritance
+    template <typename T>
+    struct is_block_matrix
+      : std::conditional_t<is_block_matrix_impl<T>::value,
+                           std::true_type,
+                           is_base_of_template<BlockMatrixBase, T>>
+    {};
+
+    // Helper variable template
+    template <typename T>
+    inline constexpr bool is_block_matrix_v = is_block_matrix<T>::value;
+
     template <int dim,
               typename Number,
               typename VectorizedArrayType,
@@ -2127,11 +2168,40 @@ namespace MatrixFreeTools
                  &data_boundary,
       MatrixType &matrix)
     {
-      std::unique_ptr<AffineConstraints<typename MatrixType::value_type>>
-        constraints_for_matrix;
-      const AffineConstraints<typename MatrixType::value_type> &constraints =
-        internal::create_new_affine_constraints_if_needed(
-          matrix, constraints_in, constraints_for_matrix);
+      std::vector<const dealii::AffineConstraints<Number> *> constraints{
+        &constraints_in};
+      compute_matrix<dim, Number>(
+        matrix_free, constraints, data_cell, data_face, data_boundary, matrix);
+    }
+    template <int dim,
+              typename Number,
+              typename VectorizedArrayType,
+              typename MatrixType>
+    void
+    compute_matrix(
+      const MatrixFree<dim, Number, VectorizedArrayType> &matrix_free,
+      const std::vector<const dealii::AffineConstraints<Number> *>
+        &constraints_in,
+      const internal::ComputeMatrixScratchData<dim, VectorizedArrayType, false>
+        &data_cell,
+      const internal::ComputeMatrixScratchData<dim, VectorizedArrayType, true>
+        &data_face,
+      const internal::ComputeMatrixScratchData<dim, VectorizedArrayType, true>
+                 &data_boundary,
+      MatrixType &matrix)
+    {
+      std::vector<
+        std::unique_ptr<AffineConstraints<typename MatrixType::value_type>>>
+        constraints_for_matrix(constraints_in.size());
+      std::vector<std::reference_wrapper<
+        const AffineConstraints<typename MatrixType::value_type>>>
+        constraints;
+      for (unsigned int i = 0; i < constraints_in.size(); ++i)
+        {
+          constraints.emplace_back(
+            internal::create_new_affine_constraints_if_needed(
+              matrix, *constraints_in[i], constraints_for_matrix[i]));
+        }
 
       const auto batch_operation =
         [&matrix_free, &constraints, &matrix](
@@ -2253,23 +2323,42 @@ namespace MatrixFreeTools
                             matrices[bi][bj][v](i, j) =
                               phi[bi]->begin_dof_values()[i][v];
                     }
-
-                  for (unsigned int v = 0; v < n_filled_lanes; ++v)
-                    for (unsigned int bi = 0; bi < n_blocks; ++bi)
-                      if (bi == bj)
-                        // specialization for blocks on the diagonal
-                        // to writing into diagonal elements of the
-                        // matrix if the corresponding degree of freedom
-                        // is constrained, see also the documentation
-                        // of AffineConstraints::distribute_local_to_global()
-                        constraints.distribute_local_to_global(
-                          matrices[bi][bi][v], dof_indices_mf[bi][v], matrix);
-                      else
-                        constraints.distribute_local_to_global(
-                          matrices[bi][bj][v],
-                          dof_indices_mf[bi][v],
-                          dof_indices_mf[bj][v],
-                          matrix);
+                  if constexpr (!is_block_matrix_v<MatrixType>)
+                    for (unsigned int v = 0; v < n_filled_lanes; ++v)
+                      for (unsigned int bi = 0; bi < n_blocks; ++bi)
+                        if (bi == bj)
+                          // specialization for blocks on the diagonal
+                          // to writing into diagonal elements of the
+                          // matrix if the corresponding degree of freedom
+                          // is constrained, see also the documentation
+                          // of AffineConstraints::distribute_local_to_global()
+                          constraints[bi].get().distribute_local_to_global(
+                            matrices[bi][bi][v], dof_indices_mf[bi][v], matrix);
+                        else
+                          constraints[bi].get().distribute_local_to_global(
+                            matrices[bi][bj][v],
+                            dof_indices_mf[bi][v],
+                            constraints[bj].get(),
+                            dof_indices_mf[bj][v],
+                            matrix);
+                  else
+                    for (unsigned int v = 0; v < n_filled_lanes; ++v)
+                      for (unsigned int bi = 0; bi < n_blocks; ++bi)
+                        if (matrix.block(bi, bj).n_nonzero_elements() != 0)
+                          {
+                            if (bi == bj)
+                              constraints[bi].get().distribute_local_to_global(
+                                matrices[bi][bi][v],
+                                dof_indices_mf[bi][v],
+                                matrix.block(bi, bj));
+                            else
+                              constraints[bi].get().distribute_local_to_global(
+                                matrices[bi][bj][v],
+                                dof_indices_mf[bi][v],
+                                constraints[bj].get(),
+                                dof_indices_mf[bj][v],
+                                matrix.block(bi, bj));
+                          }
                 }
             }
         };
